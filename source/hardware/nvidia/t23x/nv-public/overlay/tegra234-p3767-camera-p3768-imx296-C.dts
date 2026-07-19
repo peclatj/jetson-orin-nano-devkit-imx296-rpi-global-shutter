@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-FileCopyrightText: Jonathan Peclat
+
+/dts-v1/;
+/plugin/;
+
+// GPIO definitions for Jetson Orin Nano devkit
+// Source: confirmed from IMX219-A overlay
+#define CAM0_RST    TEGRA234_MAIN_GPIO(H, 3)   // gpio-391, CAM0 reset (unused by IMX296)
+#define CAM1_RST    TEGRA234_MAIN_GPIO(AC, 1)  // gpio-???, CAM1 reset (unused by IMX296)
+#define CAM0_PWDN   TEGRA234_MAIN_GPIO(H, 6)   // gpio-394, CAM0 XSHUTDOWN
+#define CAM1_PWDN   TEGRA234_MAIN_GPIO(AC, 0)  // gpio-486, CAM1 XSHUTDOWN
+#define CAM_I2C_MUX TEGRA234_AON_GPIO(CC, 3)   // gpio-331, I2C mux select
+
+#include <dt-bindings/tegra234-p3767-0000-common.h>
+#include <dt-bindings/clock/tegra234-clock.h>
+
+/ {
+    overlay-name = "Camera IMX296 on CAM1";
+    jetson-header-name = "Jetson 22pin CSI Connector";
+    compatible = JETSON_COMPATIBLE_P3768;
+
+    // IMX296 sensor on CSI port C / CAM1 (J21)
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            // VI (Video Input) - DMA engine
+            tegra-capture-vi {
+                num-channels = <1>;
+                ports {
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    vi_port0: port@0 {
+                        reg = <0>;
+                        imx296_vi_in0: endpoint {
+                            port-index = <2>;   // serial_c = CSI port 2 = CAM1
+                            bus-width = <1>;    // 1 MIPI lane
+                            remote-endpoint = <&imx296_csi_out0>;
+                        };
+                    };
+                };
+            };
+
+            // tegra-camera-platform - module registry
+            tegra-camera-platform {
+                compatible = "nvidia, tegra-camera-platform";
+                modules {
+                    module0 {
+                        badge = "imx296_front_imx296";
+                        position = "front";
+                        orientation = "1";
+                        drivernode0 {
+                            pcl_id = "v4l2_sensor";
+                            sysfs-device-tree = "/sys/firmware/devicetree/base/bus@0/cam_i2cmux/i2c@1/imx296_a@1a";
+                        };
+                    };
+                };
+            };
+
+            bus@0 {
+                // NVCSI - CSI deserializer
+                host1x@13e00000 {
+                    nvcsi@15a00000 {
+                        num-channels = <1>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        // channel@1 for CAM1
+                        csi_chan1: channel@1 {
+                            reg = <0>;
+                            ports {
+                                #address-cells = <1>;
+                                #size-cells = <0>;
+                                // port@0 = input from sensor
+                                csi_chan1_port0: port@0 {
+                                    reg = <0>;
+                                    imx296_csi_in0: endpoint@2 {
+                                        port-index = <2>;   // serial_c = CAM1
+                                        bus-width = <1>;    // 1 MIPI lane
+                                        remote-endpoint = <&imx296_out0>;
+                                    };
+                                };
+                                // port@1 = output to VI
+                                csi_chan0_port1: port@1 {
+                                    reg = <1>;
+                                    imx296_csi_out0: endpoint@3 {
+                                        remote-endpoint = <&imx296_vi_in0>;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+
+                // cam_i2cmux - GPIO controlled I2C mux
+                // i2c@0 = CAM0 (J20), i2c@1 = CAM1 (J21)
+                cam_i2cmux {
+                    status = "okay";
+                    compatible = "i2c-mux-gpio";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    mux-gpios = <&gpio_aon CAM_I2C_MUX GPIO_ACTIVE_HIGH>;
+                    i2c-parent = <&cam_i2c>;
+
+                    // CAM0 I2C bus
+                    i2c@1 {
+                        status = "okay";
+                        reg = <1>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+
+                        // IMX296 sensor node
+                        // I2C address 0x1a (confirmed from mainline DT binding)
+                        imx296_cam0: imx296_a@1a {
+                            compatible = "sony,imx296lq";  // color variant
+                            reg = <0x1a>;
+                            devnode = "video0";
+
+                            physical_w = "4.968";          // 1456 pixels * 3.45um
+                            physical_h = "3.723";          // 1088 pixels * 3.45um
+                            sensor_model = "imx296";
+
+                            use_sensor_mode_id = "false";
+
+                            /*
+                             * XSHUTDOWN - active HIGH to exit standby
+                             * Note: mainline DT binding uses GPIO_ACTIVE_LOW
+                             * but tegracam framework drives it differently.
+                             * CAM1_PWDN = TEGRA234_MAIN_GPIO(AC, 0) = gpio-486
+                             */
+                            reset-gpios = <&gpio CAM1_PWDN GPIO_ACTIVE_HIGH>;
+
+                            /*
+                             * Mode 0: 1456x1088 full resolution
+                             */
+                            mode0 {
+                                mclk_khz = "54000";
+                                num_lanes = "1";            // 1 MIPI lane
+                                tegra_sinterface = "serial_c";
+                                phy_mode = "DPHY";
+
+                                discontinuous_clk = "yes";
+                                lane_polarity = "0";
+                                dpcm_enable = "false";
+                                cil_settletime = "0";
+
+                                csi_pixel_bit_depth = "10";
+                                mode_type = "bayer";
+                                pixel_phase = "rggb"; // color sensor - confirmed empirically correct;
+                                                       // bggr/grbg/gbrg all tested and produce wrong casts.
+                                                       // Note: mainline's MEDIA_BUS_FMT_SBGGR10_1X10 does NOT
+                                                       // apply here - mainline also rotates 180 (RPi overlay
+                                                       // rotation=<180>), which flips the effective CFA order;
+                                                       // this board applies no such rotation.
+
+                                active_w = "1456"; // with blank 1760
+                                active_h = "1088"; // with blank 1118
+                                readout_orientation = "0";
+
+                                line_length = "1760";
+                                inherent_gain = "1";
+
+                                /*
+                                 * From mainline: pixel_rate = 1188MHz/10 = 118.8MHz
+                                 */
+                                pix_clk_hz = "118800000";
+
+                                /*
+                                 * Gain is dB-based on IMX296:
+                                 * register = 20 * log10(gain) * 10
+                                 * gain = 10^(register/200)
+                                 * min=0 (0dB=1x), max=480 (48.0dB~251x),
+                                 * matching mainline imx296.c IMX296_GAIN_MAX
+                                 *
+                                 * gain_factor=1 because register value IS
+                                 * the scaled value (no additional conversion)
+                                 * The set_gain function handles dB conversion
+                                 */
+                                gain_factor = "1";
+                                min_gain_val = "0";    // 0 dB = 1x
+                                max_gain_val = "480";  // 48.0 dB = ~251x
+                                step_gain_val = "1";
+                                default_gain = "0";    // 1x gain
+
+                                min_hdr_ratio = "1";
+                                max_hdr_ratio = "1";
+
+                                /*
+                                 * Frame rate calculation:
+                                 * line_period = 1100 / 74.25MHz = 14.81us
+                                 * min_vts for 60fps = 1/(60 * 14.81us) = 1126 lines
+                                 * default VTS from mainline = 1088 + 30 = 1118 lines
+                                 * max fps = 1/(1118 * 14.81us) = ~60fps
+                                 */
+                                framerate_factor = "1000000";
+                                min_framerate = "1000000";    // 1 fps
+                                max_framerate = "60000000";   // 60 fps
+                                step_framerate = "1";
+                                default_framerate = "60000000";
+
+                                /*
+                                 * Exposure calculation from libcamera:
+                                 * exposure_us = lines * 14.81us + 14.26us
+                                 * lines = (exposure_us - 14.26us) / 14.81us
+                                 * exposure_factor = 1000000 (microseconds)
+                                 * min = 1 line = ~14.81us -> round to 15us
+                                 * max = VTS - 4 lines (frameIntegrationDiff=4)
+                                 */
+                                exposure_factor = "1000000";
+                                min_exp_time = "15";       // ~1 line period
+                                max_exp_time = "15699";    // (1118-4) * 14.81us
+                                step_exp_time = "1";
+                                default_exp_time = "10000"; // 10ms default
+
+                                embedded_metadata_height = "2"; // IMX296 sends 2 embedded lines
+                            };
+
+                            ports {
+                                #address-cells = <1>;
+                                #size-cells = <0>;
+                                port@0 {
+                                    reg = <0>;
+                                    imx296_out0: endpoint {
+                                        status = "okay";
+                                        port-index = <2>;   // serial_c = CAM1
+                                        bus-width = <1>;    // 1 MIPI lane
+                                        remote-endpoint = <&imx296_csi_in0>;
+                                    };
+                                };
+                            };
+                        };
+                    };
+
+                    // Disable CAM0 side
+                    i2c@0 {
+                        imx296_c@1a {
+                            status = "disabled";
+                        };
+                    };
+                };
+
+                // GPIO hogs - drive all camera GPIOs to safe low state at boot
+                gpio@2200000 {
+                    camera-control-output-low {
+                        gpio-hog;
+                        output-low;
+                        gpios = <CAM0_RST 0>;
+                        label = "cam0-rst";
+                    };
+                };
+                gpio@6000d000 {
+                    camera-control-output-low {
+                        gpio-hog;
+                        output-low;
+                        gpios = <CAM1_PWDN 0 CAM0_PWDN 0>;
+                        label = "cam1-pwdn", "cam0-pwdn";
+                    };
+                };
+            };
+        };
+    };
+};
