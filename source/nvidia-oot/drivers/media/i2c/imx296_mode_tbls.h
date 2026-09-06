@@ -26,11 +26,20 @@ typedef struct reg_8 imx296_reg;
 
 /*
  * Mode indices - must match mode_table[] array order below.
- * IMX296 has only one resolution (1456x1088) unlike OV9281.
- * Timing is controlled via VMAX/HMAX registers, not separate mode tables.
+ *
+ * IMPORTANT: set_mode() indexes mode_table[] directly with the DT
+ * mode<N> index (s_data->mode_prop_idx), so all real sensor modes MUST
+ * come first and in DT order; the pseudo-mode entries (start/stop/test)
+ * follow and are only ever referenced by name.
+ *
+ * mode0: 1456x1088 full array @ up to 60 fps
+ * mode1: 1280x720 centered ROI crop @ up to 90 fps
+ * Timing (VMAX/SHS1/GAIN) is set in common_regs and updated dynamically
+ * by control handlers; the per-mode tables handle windowing/ROI.
  */
 enum {
 	IMX296_MODE_1456X1088 = 0,
+	IMX296_MODE_1280X720,
 	IMX296_MODE_START_STREAM,
 	IMX296_MODE_STOP_STREAM,
 	IMX296_MODE_TEST_PATTERN,
@@ -45,12 +54,13 @@ enum {
  * The other entries may or may not be optional.
  * Do NOT modify without Sony guidance.
  *
- * Clock configuration registers (0x3089-0x308c = INCKSEL0-3) are NOT
- * included here - they depend on the input clock frequency and are
- * written separately in power_get() after the clock is configured.
- * For 37.125MHz: { 0x80, 0x0b, 0x80, 0x08 }
- * For 54MHz:     { 0xb0, 0x0f, 0xb0, 0x0c }
- * For 74.25MHz:  { 0x80, 0x0f, 0x80, 0x0c }
+ * Clock configuration registers (0x3089-0x308c = INCKSEL0-3) ARE part of
+ * this table (54 MHz set, matching the RPi GS camera's on-board
+ * oscillator), together with the clock-dependent CTRL418C. Alternative
+ * sets, should a different INCK ever be used:
+ * For 37.125MHz: { 0x80, 0x0b, 0x80, 0x08 }, CTRL418C=0x74
+ * For 54MHz:     { 0xb0, 0x0f, 0xb0, 0x0c }, CTRL418C=0xa8
+ * For 74.25MHz:  { 0x80, 0x0f, 0x80, 0x0c }, CTRL418C=0xe8
  */
 static const imx296_reg imx296_common_regs[] = {
 	/* ---- Required for CSI-2 output activation ---- */
@@ -66,7 +76,21 @@ static const imx296_reg imx296_common_regs[] = {
 	{ 0x30a4, 0x5f }, /* undocumented */
 	{ 0x30a8, 0x91 }, /* undocumented */
 	{ 0x30ac, 0x28 }, /* undocumented */
-	{ 0x30af, 0x09 }, /* undocumented */
+	/*
+     * 0x30af: the ONLY byte on which the two reference drivers disagree.
+     * Mainline imx296.c ships 0x09, and the Raspberry Pi kernel driver
+     * originally shipped 0x09 too (driver-add commit cb33db2b6ccf). RPi
+     * changed it to 0x0b in commit dca33feaec31 (2024-03-04, "Updated
+     * register setting to fix Fast Trigger"): per that commit, on Sony's
+     * recommendation, 0x0b fixes a MIPI Frame End packet not being sent
+     * at end of frame. The current RPi production driver applies 0x0b
+     * unconditionally in all modes, and a missing/late FE packet is a
+     * plausible contributor to per-frame VI capture artifacts (the black
+     * line seen on every capture with 0x09), so adopt 0x0b — but note
+     * the artifact link is a hypothesis to verify on hardware, not an
+     * established cause.
+     */
+	{ 0x30af, 0x0b }, /* undocumented (RPi production value; mainline: 0x09) */
 	{ 0x30df, 0x00 }, /* undocumented */
 	{ 0x3165, 0x00 }, /* undocumented */
 	{ 0x3169, 0x10 }, /* undocumented */
@@ -124,17 +148,35 @@ static const imx296_reg imx296_common_regs[] = {
      * BLKLEVELAUTO (0x3022): automatic black level calibration
      * 0x01 = ON: sensor continuously calibrates black level
      * 0xf0 = OFF: use fixed BLKLEVEL value
+     *
+     * OFF, deviating from mainline/RPi (which run it ON outside test
+     * patterns). Measured on hardware (dark frames, 2026-07-28): the
+     * auto-calibration loop OSCILLATES - +/-1.5 counts at ~7-9 Hz at
+     * low gain, exploding to +/-35 counts at 38-44 Hz at gain 30 dB -
+     * visible as shadow/line flicker. A mid-stream register A/B cut
+     * black-level std 3.6x the moment it was disabled. The fixed
+     * BLKLEVEL=60 above matches what the RPi tuning data assumes, and
+     * both Argus and our ISP pipeline subtract a fixed 60. Tradeoff:
+     * no compensation for slow thermal dark-current drift (DC drift,
+     * not flicker) - revisit if long-session black drift appears.
      */
-	{ 0x3022, 0x01 }, /* BLKLEVELAUTO: enabled */
+	{ 0x3022, 0xf0 }, /* BLKLEVELAUTO: OFF - fixed black level (see above) */
 
 	/*
      * GAINDLY (0x3212): gain application delay
-     * 0x08 = GAINDLY_NONE:   gain applied immediately
-     * 0x09 = GAINDLY_1FRAME: gain applied after 1 frame
-     * libcamera sensorDelays.gainDelay = 2 frames, but we use
-     * immediate mode here and let the framework handle delays.
+     * 0x08 = GAINDLY_NONE:   gain applied immediately (mid-frame)
+     * 0x09 = GAINDLY_1FRAME: gain latched at the next frame boundary
+     *
+     * Use 1-frame mode, matching the RPi production driver's setup path
+     * (imx296_setup writes GAINDLY_1FRAME). SHS1/exposure changes latch
+     * at frame boundaries anyway, so with 1-frame mode an AE step's gain
+     * and exposure land on the SAME frame instead of the gain jumping
+     * mid-frame - each Argus AE adjustment produces one clean step, not
+     * a partially-applied frame. (libcamera models this as
+     * sensorDelays.gainDelay = 2: 1 frame register delay + 1 frame
+     * pipeline.)
      */
-	{ 0x3212, 0x08 }, /* GAINDLY: no delay */
+	{ 0x3212, 0x09 }, /* GAINDLY: 1-frame (RPi production value) */
 
 	/*
      * GAINCTRL (0x3200): gain control mode
@@ -149,6 +191,18 @@ static const imx296_reg imx296_common_regs[] = {
      * 0xc5 = value from mainline driver
      */
 	{ 0x4114, 0xc5 }, /* GTTABLENUM: gamma table */
+
+	/*
+     * MIPIC_AREA3W (0x4182-0x4183): MIPI output area height, 16-bit LE.
+     * The Raspberry Pi kernel driver writes this even in the un-cropped
+     * full-frame path (= IMX296_PIXEL_ARRAY_HEIGHT, 1088); mainline never
+     * touches it, leaving the power-on default. A MIPI output-area register
+     * at a stale default is the second prime suspect for the one-bad-row
+     * black-line artifact. 1088 = 0x0440. Cropped modes must override this
+     * with their own output height (RPi writes crop->height there).
+     */
+	{ 0x4182, 0x40 }, /* MIPIC_AREA3W[7:0]  = 0x40 */
+	{ 0x4183, 0x04 }, /* MIPIC_AREA3W[15:8] = 0x04 -> 1088 */
 
 	/*
      * CTRL418C: clock-dependent register
@@ -255,6 +309,49 @@ static const imx296_reg imx296_1456x1088_regs[] = {
 };
 
 /*
+ * 1280x720 @ 90fps centered ROI mode
+ *
+ * The IMX296 reads out a cropped window via the FID0_ROI block
+ * (same mechanism the Raspberry Pi kernel driver uses for crops).
+ * Line period is unchanged (HMAX stays 1100 = 14.81us), but with only
+ * 720 active lines VMAX can drop to 750, giving:
+ *   74.25MHz / (1100 * 750) = 90.0 fps exactly.
+ *
+ * Crop is centered and 4-aligned, preserving the RGGB Bayer phase:
+ *   left = (1456-1280)/2 = 88,  top = (1088-720)/2 = 184
+ *
+ * MIPIC_AREA3W must match the cropped output height (the RPi driver
+ * writes crop->height there), overriding the 1088 from common_regs.
+ * VMAX=750 also overrides common_regs' 1118 default; set_frame_rate()
+ * then recomputes VMAX from the requested framerate, floored at the
+ * mode-relative minimum (active_h + 30 = 750 for this mode — see
+ * imx296_min_frame_length(); a fixed 1118 floor would clamp 90 fps
+ * back to ~60).
+ */
+static const imx296_reg imx296_1280x720_regs[] = {
+	{ 0x300d, 0x00 }, /* CTRL0D: full readout mode, no binning */
+
+	{ 0x3300, 0x03 }, /* FID0_ROI: ROIH1ON | ROIV1ON */
+	{ 0x3310, 0x58 }, /* FID0_ROIPH1[7:0]  = 88 (crop left) */
+	{ 0x3311, 0x00 }, /* FID0_ROIPH1[15:8] */
+	{ 0x3312, 0xb8 }, /* FID0_ROIPV1[7:0]  = 184 (crop top) */
+	{ 0x3313, 0x00 }, /* FID0_ROIPV1[15:8] */
+	{ 0x3314, 0x00 }, /* FID0_ROIWH1[7:0]  = 1280 (crop width) */
+	{ 0x3315, 0x05 }, /* FID0_ROIWH1[15:8] */
+	{ 0x3316, 0xd0 }, /* FID0_ROIWV1[7:0]  = 720 (crop height) */
+	{ 0x3317, 0x02 }, /* FID0_ROIWV1[15:8] */
+
+	{ 0x4182, 0xd0 }, /* MIPIC_AREA3W[7:0]  = 720 (output height) */
+	{ 0x4183, 0x02 }, /* MIPIC_AREA3W[15:8] */
+
+	{ 0x3010, 0xee }, /* VMAX[7:0]   = 750 -> 90.0 fps */
+	{ 0x3011, 0x02 }, /* VMAX[15:8]  */
+	{ 0x3012, 0x00 }, /* VMAX[22:16] */
+
+	{ IMX296_TABLE_END, 0x00 },
+};
+
+/*
  * Start stream table - intentionally minimal.
  * The actual two-step start sequence is handled directly in
  * imx296_start_streaming() because it requires a 2ms delay
@@ -340,6 +437,7 @@ static const imx296_reg imx296_test_pattern[] = {
  */
 static const imx296_reg *const mode_table[] = {
 	[IMX296_MODE_1456X1088] = imx296_1456x1088_regs,
+	[IMX296_MODE_1280X720] = imx296_1280x720_regs,
 	[IMX296_MODE_START_STREAM] = imx296_start_stream,
 	[IMX296_MODE_STOP_STREAM] = imx296_stop_stream,
 	[IMX296_MODE_TEST_PATTERN] = imx296_test_pattern,
@@ -352,11 +450,13 @@ static const imx296_reg *const mode_table[] = {
  * but 60fps is the practical maximum for this clock configuration.
  */
 static const int imx296_60fps[] = { 60 };
+static const int imx296_90fps[] = { 90 };
 
 /*
  * imx296_frmfmt - frame format table
- * Single entry - IMX296 has one native resolution.
  * Consumed by camera_common framework for V4L2 format enumeration.
+ * MUST stay in sync with the DT mode<N> nodes: entry order matches the
+ * mode enum / DT mode index (frmfmt count == number of DT modes).
  */
 static const struct camera_common_frmfmt imx296_frmfmt[] = {
 	{
@@ -365,6 +465,13 @@ static const struct camera_common_frmfmt imx296_frmfmt[] = {
 		.num_framerates = 1,
 		.hdr_en = false,
 		.mode = IMX296_MODE_1456X1088,
+	},
+	{
+		.size = { 1280, 720 },
+		.framerates = imx296_90fps,
+		.num_framerates = 1,
+		.hdr_en = false,
+		.mode = IMX296_MODE_1280X720,
 	},
 };
 

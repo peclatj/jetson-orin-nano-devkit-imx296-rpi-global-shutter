@@ -1,0 +1,41 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Reparent the PWM7 controller (40-pin header pin 32) from pllp_out0
+ * (408 MHz) to clk_m (19.2 MHz) so it can generate camera-trigger-rate
+ * pulse trains. With the default 408 MHz source the 13-bit divider caps
+ * periods at ~5.1 ms (>= ~195 Hz); from 19.2 MHz the range is ~9 Hz to
+ * 75 kHz with EXACT 30.000 / 60.000 / 120.000 Hz (19.2e6 / 256 / n).
+ *
+ * Notes:
+ *  - duty resolution is 8-bit (256 steps/period): 65.1 us exposure
+ *    granularity at 60 Hz - measure the real pulse width and set the
+ *    nvimx296camerasrc `exposure` property to the measured value.
+ *  - the Tegra PWM cannot invert polarity (idle-low, high pulses);
+ *    the XTR line is active-low, so drive it through an inverting
+ *    open-drain/MOSFET level stage (which the 1.8 V shift needs anyway).
+ *
+ * Standalone build (no kernel includes; clock IDs hardcoded from
+ * dt-bindings/clock/tegra234-clock.h: PWM7=111, CLK_M=14):
+ *   dtc -@ -I dts -O dtb -o tegra234-p3767-imx296-trigger-pwm7-clk.dtbo \
+ *       tegra234-p3767-imx296-trigger-pwm7-clk.dts
+ * Wire into the boot entry with:
+ *   configure_camera_dt.py ... --pwm 32 \
+ *       --extra-overlay /boot/tegra234-p3767-imx296-trigger-pwm7-clk.dtbo
+ */
+
+/ {
+	overlay-name = "IMX296 trigger PWM7 clock: clk_m parent (exact 30/60 Hz)";
+	compatible = "nvidia,p3768-0000+p3767-0000",
+		     "nvidia,p3768-0000+p3767-0000-super",
+		     "nvidia,p3767-0000", "nvidia,tegra234";
+
+	fragment@0 {
+		target-path = "/bus@0/pwm@32e0000";
+		__overlay__ {
+			assigned-clocks = <&bpmp 111>;		/* TEGRA234_CLK_PWM7 */
+			assigned-clock-parents = <&bpmp 14>;	/* TEGRA234_CLK_CLK_M */
+		};
+	};
+};

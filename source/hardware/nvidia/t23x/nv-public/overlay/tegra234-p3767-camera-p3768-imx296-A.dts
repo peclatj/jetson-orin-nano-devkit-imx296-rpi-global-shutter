@@ -214,6 +214,60 @@
                                 embedded_metadata_height = "2"; // IMX296 sends 2 embedded lines
                             };
 
+                            /*
+                             * Mode 1: 1280x720 centered ROI crop @ 90 fps
+                             * Same line period (HMAX=1100 -> 14.81us);
+                             * VMAX drops to 750 -> exactly 90.0 fps.
+                             * Crop left=88 top=184 (even -> RGGB preserved).
+                             */
+                            mode1 {
+                                mclk_khz = "54000";
+                                num_lanes = "1";            // 1 MIPI lane
+                                tegra_sinterface = "serial_b";
+                                phy_mode = "DPHY";
+
+                                discontinuous_clk = "yes";
+                                lane_polarity = "6";
+                                dpcm_enable = "false";
+                                cil_settletime = "0";
+
+                                csi_pixel_bit_depth = "10";
+                                mode_type = "bayer";
+                                pixel_phase = "rggb";
+
+                                active_w = "1280";
+                                active_h = "720";
+                                readout_orientation = "0";
+
+                                line_length = "1760";
+                                inherent_gain = "1";
+
+                                pix_clk_hz = "118800000"; // 1188Mbps / 10
+
+                                gain_factor = "1";
+                                min_gain_val = "0";    // 0 dB = 1x
+                                max_gain_val = "480";  // 48.0 dB = ~251x
+                                step_gain_val = "1";
+                                default_gain = "0";    // 1x gain
+
+                                min_hdr_ratio = "1";
+                                max_hdr_ratio = "1";
+
+                                framerate_factor = "1000000";
+                                min_framerate = "1000000";    // 1 fps
+                                max_framerate = "90000000";   // 90 fps (VMAX=750)
+                                step_framerate = "1";
+                                default_framerate = "90000000";
+
+                                exposure_factor = "1000000";
+                                min_exp_time = "15";       // ~1 line period
+                                max_exp_time = "11066";    // (750-4)*14.81us + 14.26us
+                                step_exp_time = "1";
+                                default_exp_time = "8000"; // 8ms default
+
+                                embedded_metadata_height = "2"; // IMX296 sends 2 embedded lines
+                            };
+
                             ports {
                                 #address-cells = <1>;
                                 #size-cells = <0>;
@@ -230,15 +284,16 @@
                         };
                     };
 
-                    // Disable CAM1 side
-                    i2c@1 {
-                        imx296_c@1a {
-                            status = "disabled";
-                        };
-                    };
+                    /*
+                     * (Removed) A "disable CAM1 side" block used to disable
+                     * a phantom i2c@1/imx296_c@1a node that no overlay ever
+                     * creates (the -C overlay names its node imx296_a@1a
+                     * too). The base DTB carries no camera nodes at all, so
+                     * there is nothing to disable here.
+                     */
                 };
 
-                // GPIO hogs - drive all camera GPIOs to safe low state at boot
+                // GPIO hog - park the unused legacy CAM1 reset line low at boot
                 gpio@2200000 {
                     camera-control-output-low {
                         gpio-hog;
@@ -247,14 +302,15 @@
                         label = "cam1-rst";
                     };
                 };
-                gpio@6000d000 {
-                    camera-control-output-low {
-                        gpio-hog;
-                        output-low;
-                        gpios = <CAM1_PWDN 0 CAM0_PWDN 0>;
-                        label = "cam1-pwdn", "cam0-pwdn";
-                    };
-                };
+                /*
+                 * (Removed) A gpio@6000d000 hog block used to "park"
+                 * CAM0_PWDN and CAM1_PWDN low. 0x6000d000 is the Tegra210
+                 * legacy GPIO controller address - it does not exist on
+                 * Tegra234, so the hog never applied (silently inert).
+                 * Do NOT re-add it under the real gpio@2200000 either: the
+                 * driver gpio_request()s the active camera's PWDN line, and
+                 * a live hog on it would fail the probe with -EBUSY.
+                 */
             };
         };
     };

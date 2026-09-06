@@ -1,241 +1,229 @@
-# IMX296 Driver for Jetson Orin Nano
+# IMX296 Driver for Jetson Orin
 
 A Linux V4L2 sensor driver and device-tree overlays that bring the Sony
-IMX296 global-shutter sensor (as used on the **Raspberry Pi Global Shutter
-Camera**) to the **NVIDIA Jetson Orin Nano** dev kit, using NVIDIA's
-`tegracam` camera framework.
+IMX296 global-shutter sensor (the **Raspberry Pi Global Shutter Camera**) to
+**NVIDIA Jetson Orin** devkits, using NVIDIA's `tegracam` framework.
 
-> **Status: early / experimental.** The sensor streams and basic controls
-> (gain, exposure, frame rate, group hold) are implemented, but this has only
-> been bring-up-tested by one person on one board. Expect bugs, and please
-> report or send patches for anything you find. See [Known
-> issues](#known-issues--limitations) below before relying on this for
-> anything.
+The register documentation in `doc/` remains the best public reference for
+this sensor. Since the initial bring-up, the driver has picked up a set of
+functional fixes found via adversarial review and hardware forensics,
+dual-camera and 90 fps support, an experimental external-trigger mode, and a
+full custom-ISP path that bypasses Argus entirely (see below) — see
+[Credits](#credits) for who did what.
+
+> **Status: working.** Probes, streams, and records on Jetson Orin NX 16GB
+> (devkit carrier, JetPack 6 / L4T r36.5.0) in daily use; Also on Orin Nano (JetPack 6.2.2).
 
 ## Features
 
-- V4L2 subdevice driver (`nv_imx296.c`) built against NVIDIA's `tegracam_core`
-  framework, modeled on NVIDIA's own `nv_imx185.c` and the mainline
-  `drivers/media/i2c/imx296.c`.
-- Auto-detects color (IMX296LQ) vs. monochrome (IMX296LL) variants via the
+- V4L2 subdevice driver (`nv_imx296.c`) built on NVIDIA's `tegracam_core`
+  framework.
+- Auto-detects color (IMX296LQ) vs monochrome (IMX296LL) variants via the
   sensor's `SENSOR_INFO` register, or can be forced via a device-tree
   `compatible` string.
-- Controls: gain, exposure, frame rate, group hold, fuse/sensor ID.
-- Device-tree overlays for both CSI connectors on the Jetson Orin Nano dev
-  kit carrier board (P3768): CAM0 (`-A`) and CAM1 (`-C`).
+- Controls: gain, exposure, frame rate, group hold, fuse/sensor ID, and an
+  experimental external-trigger mode.
+- Two sensor modes: 1456×1088 @ 60 fps, and a centered-ROI 1280×720 @ 90 fps.
+- Device-tree overlays for CAM0 (`-A`), CAM1 (`-C`), and simultaneous
+  dual-camera (`-dual`) operation on the Jetson Orin devkit carrier (P3768).
 - Optional vertical-flip / horizontal-mirror device-tree properties.
-- (**Does not work yet**) A minimal userspace ISP script (`scripts/imx296_isp_pipeline.py`) that
+- A userspace ISP pipeline script (`scripts/imx296_isp_pipeline.py`) that
   applies real Raspberry Pi/libcamera tuning data (black level, CCM, gamma)
-  to the raw Bayer capture, since NVIDIA's Argus ISP has no path to create a tuning files without being a nvidia partner.
+  to the raw Bayer capture, since NVIDIA's Argus ISP has no path to load a
+  third-party tuning file.
+- External-trigger tooling (`scripts/configure_camera_dt.py`,
+  `scripts/trigger_pwm.sh`) to fire capture off an external PWM signal — see
+  `doc/external-trigger-howto.md`.
+
+See [Changelog](#changelog) for the fixes and root causes behind these.
 
 ## Repository layout
 
 ```
 source/
   nvidia-oot/drivers/media/i2c/
-    nv_imx296.c            Sensor driver
-    imx296_mode_tbls.h      Register tables / mode definitions
-    Makefile                 Adds nv_imx296.o to the existing i2c driver list
+    nv_imx296.c              Sensor driver (tegracam)
+    imx296_mode_tbls.h       Register tables: mode0 1456x1088@60, mode1 1280x720@90
+    Makefile                 Adds nv_imx296.o to the i2c module list
   hardware/nvidia/t23x/nv-public/overlay/
-    tegra234-p3767-camera-p3768-imx296-A.dts   Overlay for CAM0 (J20)
-    tegra234-p3767-camera-p3768-imx296-C.dts   Overlay for CAM1 (J21)
-    Makefile                 Adds both .dtbo targets to the existing overlay list
+    tegra234-p3767-camera-p3768-imx296-A.dts     CAM0 (J20) single
+    tegra234-p3767-camera-p3768-imx296-C.dts     CAM1 (J21) single
+    tegra234-p3767-camera-p3768-imx296-dual.dts  both connectors
+    tegra234-p3767-imx296-trigger-pwm7-clk.dts   clk_m reparent overlay for exact trigger-PWM rates
+    Makefile                 Adds the .dtbo targets
 
-scripts/                   Build / deploy / capture helper scripts (see below)
+scripts/
+  install.sh                 Target-side installer (module + dtbo + boot entry)
+  configure_camera_dt.py     Configures camera-layout / external-trigger DT + PWM wiring
+  trigger_pwm.sh              Drives the external-trigger PWM pulse train
+  imx296_isp_pipeline.py      Offline/live raw -> color ISP pipeline (see Capturing below)
+
 doc/
-  imx296_registers.typ      Typst register reference (known/partial/unknown fields)
-  external_sources/          Reference material this driver was derived from
-                              (mainline imx296.c, libcamera cam helper, tuning JSON, etc.)
+  imx296_registers.typ        Register reference (typ/pdf)
+  external-trigger-howto.md   External trigger wiring, arming, and verification cautions
+  external_sources/           Mirrored reference material (mainline driver, tuning data, etc.)
 ```
 
-The files under `source/` mirror the exact path layout of NVIDIA's
-`Linux_for_Tegra/source` tree, so they can be copied straight on top of it
-(see below).
+The files under `source/` mirror the L4T `Linux_for_Tegra/source` layout and
+copy straight on top of it.
 
-## Prerequisites
+**Companion project:** the recommended way to *consume* this driver is
+[`nvimx296camerasrc`][nvimx296camerasrc] — a GStreamer source element with a
+fused CUDA ISP that uses the real RPi/libcamera tuning data and replaces
+`nvarguscamerasrc`/Argus entirely: no AE hunting, no TNR, correct color,
+zero-copy from sensor DMA to `memory:NVMM` NV12 at 60/90 fps. It began life
+in this repo (see git history through the `feat/cuda-isp` /
+`feat/zero-copy-capture` merges) and is maintained as its own CMake project.
 
-- A Jetson Orin Nano dev kit running JetPack 6.x (developed against **JetPack
-  6.2.2**).
-- NVIDIA's L4T kernel/BSP sources (`public_sources.tbz2`) for the matching
-  JetPack release, from the [Jetson Linux
-  archive](https://developer.nvidia.com/embedded/jetson-linux-archive).
-- The matching `l4t-gcc` cross-compilation toolchain, from the [Jetson Linux
-  Toolchain
-  guide](https://docs.nvidia.com/jetson/archives/r34.1/DeveloperGuide/text/AT/JetsonLinuxToolchain.html).
-- An IMX296-based sensor board (e.g. the Raspberry Pi Global Shutter Camera)
-  wired to CAM0 or CAM1 on the 22-pin CSI connector.
+## Build
 
-## Build & install
-
-### 1. Set up the toolchain
-
-Add to your shell profile (adjust the path to where you extracted the
-toolchain):
+Against an extracted JetPack 6 `Linux_for_Tegra/source` tree (versions must
+match the target's L4T exactly — check `cat /etc/nv_tegra_release`):
 
 ```bash
-export CROSS_COMPILE=$HOME/nvidia/l4t-gcc/aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-
+cp -r source/* /path/to/Linux_for_Tegra/source/
+cd /path/to/Linux_for_Tegra/source
+export KERNEL_HEADERS=/usr/src/linux-headers-$(uname -r)-ubuntu22.04_aarch64/3rdparty/canonical/linux-jammy/kernel-source
+make modules   # -> nvidia-oot/drivers/media/i2c/nv_imx296.ko
+make dtbs      # -> kernel-devicetree/generic-dts/dtbs/tegra234-p3767-camera-p3768-imx296-{A,C,dual}.dtbo
 ```
 
-### 2. Overlay this repo's sources onto the L4T source tree
+(Native build on the Jetson works with the stock `linux-headers` package, as
+above; cross-building from x86 works with the upstream `scripts/build_*.sh`
+after adjusting the hardcoded paths.)
 
-Copy the contents of `source/` on top of your extracted `Linux_for_Tegra/source`
-tree, e.g.:
+## Install on the target
 
-```bash
-cp -r source/* ~/nvidia/nvidia_sdk/JetPack_6.2.2_Linux_JETSON_ORIN_NANO_TARGETS/Linux_for_Tegra/source/
-```
-
-### 3. Build the kernel module and device tree
-
-```bash
-./scripts/build_modules.sh   # builds nv_imx296.ko (and the rest of the i2c modules)
-./scripts/build_dtbo.sh      # builds the imx296-A / imx296-C .dtbo overlays
-```
-
-Both scripts expect the JetPack 6.2.2 source layout referenced above; edit
-the path at the top of each script if yours differs. `./scripts/clean_modules.sh`
-cleans the kernel module build.
-
-### 4. Deploy to the Jetson
-
-```bash
-./scripts/upload_camera_driver.sh   # scp's the .ko and .dtbo files to the target over SSH
-```
-
-This script assumes an SSH host alias named `nano-lan` and a
-`~/camera_modules/` / `~/camera_dtbo/` layout on the target. Adjust it (or
-just `scp` the files yourself) to match your setup.
-
-### 5. Point the bootloader at the overlay
-
-Edit `/boot/extlinux/extlinux.conf` on the Jetson to add a boot entry that
-loads the overlay, e.g. for CAM1 (`-C`):
+1. Copy the `.dtbo`(s) to `/boot/` and the `.ko` somewhere convenient.
+2. Add a **non-default** extlinux label (keep your known-good default
+   bootable — a bad camera boot then costs one power-cycle, nothing more):
 
 ```
-LABEL custom_camera_imx296_c
-    MENU LABEL Custom Header Config: <CSI Camera IMX296-C>
+LABEL imx296
+    MENU LABEL IMX296 GS camera
     LINUX /boot/Image
-    FDT /boot/dtb/kernel_tegra234-p3768-0000+p3767-0005-nv-super.dtb
+    FDT /boot/dtb/<your-base-dtb>.dtb
     INITRD /boot/initrd
-    APPEND ${cbootargs} root=PARTUUID=<your-root-partuuid> rw rootwait rootfstype=ext4 \
-        mminit_loglevel=4 console=ttyTCU0,115200 firmware_class.path=/etc/firmware \
-        fbcon=map:0 video=efifb:off console=tty0 efi=runtime pci=pcie_bus_perf \
-        nvme.use_threaded_interrupts=1 nv-auto-config
-    OVERLAYS /home/nvidia/camera_dtbo/tegra234-p3767-camera-p3768-imx296-C.dtbo
+    APPEND <copy the APPEND line of your working label>
+    OVERLAYS /boot/tegra234-p3767-camera-p3768-imx296-A.dtbo
 ```
 
-Set `DEFAULT custom_camera_imx296_c` (or the CAM0 equivalent) and reboot.
+Use `...-C.dtbo` for CAM1 or `...-dual.dtbo` for both. Do **not** co-apply
+the two single overlays (they share `video0`).
 
-### 6. Load the driver and verify
+3. Reboot, pick the label at the boot menu, and load the driver manually:
 
 ```bash
-./scripts/load_camera_module.sh   # sudo insmod camera_modules/nv_imx296.ko
-sudo dmesg
+sudo insmod nv_imx296.ko     # keep it manual until proven on your setup;
+                             # auto-loading an unproven camera driver in
+                             # modules-load.d is how boards get bricked
+sudo dmesg | grep imx296
 ```
 
-Expect something like:
+Expected probe:
 
 ```
 imx296 9-001a: probing IMX296 sensor
-imx296 9-001a: mclk not in DT, assume sensor driven externally
-imx296 9-001a: imx296_power_get: reset_gpio = 486, valid = 1
-imx296 9-001a: tegracam sensor driver:imx296_v2.0.6
-imx296 9-001a: imx296_power_on: gpio value after release = 1
 imx296 9-001a: IMX296LQ (color) detected (sensor_info=0x4a00)
 tegra-camrtc-capture-vi tegra-capture-vi: subdev imx296 9-001a bound
 imx296 9-001a: IMX296LQ sensor detected and registered
 ```
 
-## Capturing frames
+## Capturing
 
-Raw V4L2 capture:
+`scripts/imx296_isp_pipeline.py` needs `python3-opencv` (OpenCV for Python)
+and `numpy` installed.
 
-```bash
-./scripts/generate_raw_frame.sh   # v4l2-ctl capture -> frame.raw (1456x1088, RG10)
-```
-
-Decode a raw capture to PNG (per-CFA-plane previews, debayered RGB, and a
-grayscale preview):
+**Raw V4L2** (both modes; Orin's VI needs a 64-byte-aligned stride —
+`preferred_stride` below):
 
 ```bash
-./scripts/raw_2_png.py frame.raw
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=1456,height=1088,pixelformat=RG10 \
+         -c preferred_stride=2944
+v4l2-ctl -d /dev/video0 -c exposure=8333,gain=100    # us; dB*10
+v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-skip=4 \
+         --stream-to=frame.raw
+python3 scripts/imx296_isp_pipeline.py --input frame.raw   # -> color PNG (auto AWB)
 ```
 
-![Debayered RGB output from raw_2_png.py](doc/images/frame_rgb.png)
+**Best quality / live** — use the companion
+[`nvimx296camerasrc`][nvimx296camerasrc] element (see above).
 
-The image above is rotated 90° clockwise relative to the sensor's native
-capture orientation (no rotation correction is applied yet, see [Known
-issues](#known-issues--limitations)). There is also a faint line running
-top-to-bottom across the frame here; since the image is rotated 90°, that
-is really a **black horizontal line running across the sensor's native
-frame** that shows up on every capture. Not yet root-caused.
-
-**(Does not work yet)**
-Run the full raw -> debayer -> WB -> CCM -> gamma pipeline using real
-libcamera/Raspberry Pi tuning data instead of Argus:
+**Via Argus** (`nvarguscamerasrc`) — works, but Argus has no tuning profile
+for this sensor: colors are approximate and the untuned auto-exposure loop
+*hunts* (~25% brightness oscillation measured). If you must use it, pin
+everything:
 
 ```bash
-./scripts/imx296_isp_pipeline.py
-```
-You need OpenCV for python and numpy installed.
-
-**(Works but gives dull colors)**
-GStreamer live streaming over the network (`nvarguscamerasrc` -> JPEG/RTP on
-the Jetson, receive with GStreamer on another machine):
-
-```bash
-./scripts/stream_imx296.sh     # on the Jetson (edit the target host/port first)
-./scripts/receive_imx296.sh    # on the receiving machine
-```
-You may need this variable:
-```
-export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+gst-launch-1.0 nvarguscamerasrc sensor-mode=0 tnr-mode=0 ee-mode=0 \
+    aelock=true awblock=true aeantibanding=0 \
+    exposuretimerange="8333000 8333000" gainrange="60 60" \
+    ispdigitalgainrange="1 1" \
+  ! 'video/x-raw(memory:NVMM),width=1456,height=1088,framerate=60/1' ! nv3dsink
 ```
 
-![nvarguscamerasrc/Argus capture, untuned colors](doc/images/nvarguscamerasrc_pipeline.png)
-
-Capture from the `nvarguscamerasrc`/Argus pipeline above (also rotated 90°
-clockwise from the sensor's native orientation). The colors are not
-correctly tuned: NVIDIA's Argus ISP has no supported path to create a tuning file without being a partner, so
-there is no color matrix / white balance / tone curve calibrated for this
-sensor. `scripts/imx296_isp_pipeline.py` is the attempt to work around this
-by applying the real Raspberry Pi/libcamera tuning data outside of Argus,
-but this is still being worked on.
+(8.333 ms is the only mains-flicker-immune exposure at any frame rate; gain
+is dB×10, 0–480, halve exposure ⇒ +60 gain.)
 
 ## Known issues / limitations
 
-- Only one resolution/mode is exposed (1456x1088 full array, 60 fps max);
-  no cropped/binned modes yet.
-- A **black horizontal line** (in the sensor's native, unrotated frame)
-  shows up across every raw capture; see `doc/images/frame_rgb.png`. Cause
-  not yet identified.
-- `nvarguscamerasrc`/Argus output is not color-tuned, since there is no
-  supported way to load a third-party ISP tuning file into Argus for a
-  sensor NVIDIA doesn't ship a profile for; see
-  `doc/images/nvarguscamerasrc_pipeline.png`.
-- No HDR, EEPROM, or OTP support.
-- `#define DEBUG` is currently left enabled in `nv_imx296.c`, which dumps the
-  full register set (and adds extra delay) on every mode-set/start/stop.
-  Useful for bring-up, but noisy and slow for normal use.
-- Verified against JetPack 6.2.2 on the Jetson Orin Nano dev kit only. Other
-  L4T versions or Jetson boards are untested.
+- **Argus colors remain untuned** (NVIDIA provides no path to load a
+  third-party tuning file) — by design unfixable in Argus; solved properly
+  by the companion CUDA ISP element instead.
+- **CFA phase mystery**: raw-domain site statistics look G-first while the
+  `RG10` fourcc claims RGGB; the demosaic mapping used everywhere here is
+  empirically color-correct, but the discrepancy is unexplained. Affects
+  only code doing mosaic-domain math.
+- Do not `rmmod` the driver while an Argus client is running/tearing down —
+  NVIDIA's camera stack races a use-after-free (observed kernel panic).
+  Stop `nvargus-daemon` first.
+- Monochrome variant (IMX296LL) is detected but has never been
+  hardware-tested; no EEPROM/OTP/HDR support.
+- Dual-overlay operation is code-complete and boots, but simultaneous
+  two-camera streaming awaits second-camera hardware validation.
+- With `BLKLEVELAUTO` disabled (flicker fix), slow thermal black-level drift
+  is uncompensated — if you see shadow lift in long sessions, use the ISP
+  element's `black-offset` property.
+- **External trigger mode is new and lightly tested** — read
+  `doc/external-trigger-howto.md`'s wiring and arming cautions before relying
+  on it.
 
-## Contributing
+## Changelog
 
-This is very much a work in progress, put together by trial and error
-against sparse/undocumented sensor registers. Issues, corrections, and pull
-requests are very welcome, especially from anyone with Sony IMX296 datasheet
-access or mainline `imx296.c`/tegracam experience.
+Notable fixes and additions since the initial bring-up. Each landed as its
+own `--no-ff` merge, one branch per fix — `git log` has the full history and
+rationale, and any of them can be reverted as a single merge commit.
 
-## References
+| Change | Details |
+|---|---|
+| Fixed exposure control | The sensor's 14 µs readout offset was being scaled by `exposure_factor` *before* subtraction instead of after — the math wrapped and pinned SHS1 at max, so the V4L2/Argus exposure control silently did nothing. Now correct and verified monotonic on hardware. |
+| Fixed black horizontal line | Two register deltas vs the RPi *production* driver: init byte `0x30af = 0x0b` (RPi's Fast-Trigger/MIPI-FE fix, on Sony's advice) and the missing `MIPIC_AREA3W (0x4182) = height` write. Verified gone on real captures. |
+| Fixed shadow/line flicker | The sensor's automatic black-level servo (`BLKLEVELAUTO`) oscillates ±1.5 counts @ 7–9 Hz (±35 @ 30 dB gain) — proven with capped-lens dark frames and a mid-stream register A/B. Disabled in favor of the fixed level the tuning data assumes (trade-off: no thermal-drift compensation; a manual trim exists in the companion ISP element). |
+| Gain now latches at frame boundary | `GAINDLY` set to 1-frame mode (the RPi production value) so gain+exposure steps land atomically on one frame. |
+| Added 1280×720 @ 90 fps mode (mode1) | Centered ROI crop, VMAX 750 → exactly 90.0 fps. Required making the driver's VMAX floor mode-relative — without that, the frame-rate control silently clamped the new mode back to ~60 fps. |
+| Added dual-camera overlay | `tegra234-p3767-camera-p3768-imx296-dual.dtbo` (both CSI connectors at once, `video0` + `video1`), modeled on NVIDIA's imx477-dual overlay. |
+| Removed overlay defects | PWDN gpio-hogs had targeted a Tegra210 address that doesn't exist on Orin (silently inert — and dangerous to "fix" in place); also removed phantom disable nodes and a `channel@1`/`reg=<0>` contradiction in the -C overlay. |
+| `#define DEBUG` off by default | Previously shipped with full register dumps plus a 1 s sleep inside every stream start. |
+| Rewrote ISP script (`scripts/imx296_isp_pipeline.py`) | Previous version didn't run (wrong tuning path). Now: offline/live raw → color pipeline with curve-constrained auto-AWB, argparse CLI, both sensor modes. |
+| Added external trigger mode (experimental) | New `trigger_mode` V4L2 control, plus `scripts/configure_camera_dt.py` (DT/PWM wiring) and `scripts/trigger_pwm.sh` (drives the trigger pulse train). Preliminary work — wiring, arming, and verification are documented in `doc/external-trigger-howto.md`, but this path is less hardware-proven than the fixes above; read the cautions there before wiring anything up. |
+| Added register provenance comments | Every deviating byte cites its source (mainline vs RPi tree vs measured) directly in the code. |
 
-- Mainline Linux driver: `drivers/media/i2c/imx296.c` by Laurent Pinchart
-  (mirrored in `doc/external_sources/linux_imx296.c`).
-- libcamera IMX296 camera helper (`cam_helper_imx296.cpp`), mirrored in
-  `doc/external_sources/`.
-- `doc/imx296_registers.typ`: register-by-register reference distilled from
-  this driver's source comments, marked known/partial/unknown per field.
+## Credits
+
+- **Jonathan Péclat** — original bring-up, driver, overlays, and register
+  documentation this driver stands on.
+- **William Reed Seal-Foss** — the fixes, dual-camera/90 fps support,
+  external-trigger mode, and ISP pipeline rewrite described above.
+- Mainline `drivers/media/i2c/imx296.c` (Laurent Pinchart) and the Raspberry
+  Pi kernel/libcamera projects — register sequences, tuning data, and the
+  production reference against which the fixes here were verified.
+- NVIDIA's `nv_imx185`/`gst-nvv4l2camera` sources — tegracam and NVMM
+  conventions.
 
 ## License
 
 GPL-2.0, see [LICENSE](LICENSE).
+
+<!-- Companion-repo link: update this ONE definition when the
+     nvimx296camerasrc repository is published. -->
+[nvimx296camerasrc]: https://github.com/sealfoss/GStreamer-NV-IMX296-Camera-Source
