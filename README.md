@@ -1,40 +1,41 @@
-# IMX296 Driver for Jetson Orin (hardened fork)
+# IMX296 Driver for Jetson Orin
 
 A Linux V4L2 sensor driver and device-tree overlays that bring the Sony
 IMX296 global-shutter sensor (the **Raspberry Pi Global Shutter Camera**) to
 **NVIDIA Jetson Orin** devkits, using NVIDIA's `tegracam` framework.
 
-This is a **fork** of Jonathan Péclat's
-[jetson-orin-nano-devkit-imx296-rpi-global-shutter](https://github.com/peclatj/jetson-orin-nano-devkit-imx296-rpi-global-shutter),
-which did the original bring-up (and whose register documentation in `doc/`
-remains the best public reference for this sensor). On top of it, this fork
-fixes several functional defects found by adversarial review and hardware
-forensics, adds dual-camera and 90 fps support, and pairs the driver with a
-full custom-ISP path that bypasses Argus entirely.
+The register documentation in `doc/` remains the best public reference for
+this sensor. Since the initial bring-up, the driver has picked up a set of
+functional fixes found via adversarial review and hardware forensics,
+dual-camera and 90 fps support, an experimental external-trigger mode, and a
+full custom-ISP path that bypasses Argus entirely (see below) — see
+[Credits](#credits) for who did what.
 
 > **Status: working.** Probes, streams, and records on Jetson Orin NX 16GB
-> (devkit carrier, JetPack 6 / L4T r36.5.0) in daily use; original upstream
-> was validated on Orin Nano (JetPack 6.2.2). The upstream README's two big
-> known issues — the black line on every frame and dull/flickering images —
-> are fixed or root-caused here (see below).
+> (devkit carrier, JetPack 6 / L4T r36.5.0) in daily use; Also on Orin Nano (JetPack 6.2.2).
 
-## What this fork changes vs upstream
+## Features
 
-| Change | Why |
-|---|---|
-| **Exposure control fixed** | Upstream subtracted the 14 µs readout offset scaled ×1,000,000 (= 14 *seconds*) — the math wrapped and pinned SHS1 at max: the V4L2/Argus exposure control silently did nothing. Now correct and verified monotonic on hardware. |
-| **Black horizontal line fixed** | Two register deltas vs the RPi *production* driver: init byte `0x30af = 0x0b` (RPi's Fast-Trigger/MIPI-FE fix, on Sony's advice) and the missing `MIPIC_AREA3W (0x4182) = height` write. Verified gone on real captures. |
-| **Shadow/line flicker fixed** | The sensor's automatic black-level servo (`BLKLEVELAUTO`) oscillates ±1.5 counts @ 7–9 Hz (±35 @ 30 dB gain) — proven with capped-lens dark frames and a mid-stream register A/B. Disabled in favor of the fixed level the tuning data assumes (trade-off: no thermal-drift compensation; a manual trim exists in the companion ISP element). |
-| **Gain latches at frame boundary** | `GAINDLY` 1-frame mode (the RPi production value) so gain+exposure steps land atomically on one frame. |
-| **1280×720 @ 90 fps mode (mode1)** | Centered ROI crop, VMAX 750 → exactly 90.0 fps. Includes making the driver's VMAX floor mode-relative — without that, the frame-rate control silently clamps the new mode back to ~60 fps. |
-| **Dual-camera overlay** | `tegra234-p3767-camera-p3768-imx296-dual.dtbo` (both CSI connectors at once, `video0` + `video1`), modeled on NVIDIA's imx477-dual overlay. |
-| **Overlay defects removed** | Upstream's PWDN gpio-hogs targeted a Tegra210 address that doesn't exist on Orin (silently inert — and dangerous to "fix" in place); phantom disable nodes; a `channel@1`/`reg=<0>` contradiction in the -C overlay. |
-| **`#define DEBUG` off by default** | Upstream shipped with full register dumps plus a 1 s sleep inside every stream start. |
-| **ISP script rewritten** (`scripts/imx296_isp_pipeline.py`) | Upstream's didn't run (wrong tuning path). Now: offline/live raw → color pipeline with curve-constrained auto-AWB, argparse CLI, both sensor modes. |
-| Register provenance comments | Every deviating byte cites its source (mainline vs RPi tree vs measured). |
+- V4L2 subdevice driver (`nv_imx296.c`) built on NVIDIA's `tegracam_core`
+  framework.
+- Auto-detects color (IMX296LQ) vs monochrome (IMX296LL) variants via the
+  sensor's `SENSOR_INFO` register, or can be forced via a device-tree
+  `compatible` string.
+- Controls: gain, exposure, frame rate, group hold, fuse/sensor ID, and an
+  experimental external-trigger mode.
+- Two sensor modes: 1456×1088 @ 60 fps, and a centered-ROI 1280×720 @ 90 fps.
+- Device-tree overlays for CAM0 (`-A`), CAM1 (`-C`), and simultaneous
+  dual-camera (`-dual`) operation on the Jetson Orin devkit carrier (P3768).
+- Optional vertical-flip / horizontal-mirror device-tree properties.
+- A userspace ISP pipeline script (`scripts/imx296_isp_pipeline.py`) that
+  applies real Raspberry Pi/libcamera tuning data (black level, CCM, gamma)
+  to the raw Bayer capture, since NVIDIA's Argus ISP has no path to load a
+  third-party tuning file.
+- External-trigger tooling (`scripts/configure_camera_dt.py`,
+  `scripts/trigger_pwm.sh`) to fire capture off an external PWM signal — see
+  `doc/external-trigger-howto.md`.
 
-Every change was merged with `--no-ff`, one branch per fix — `git log` is
-the changelog, and any fix can be reverted as a single merge commit.
+See [Changelog](#changelog) for the fixes and root causes behind these.
 
 ## Repository layout
 
@@ -48,10 +49,19 @@ source/
     tegra234-p3767-camera-p3768-imx296-A.dts     CAM0 (J20) single
     tegra234-p3767-camera-p3768-imx296-C.dts     CAM1 (J21) single
     tegra234-p3767-camera-p3768-imx296-dual.dts  both connectors
-    Makefile                 Adds the three .dtbo targets
+    tegra234-p3767-imx296-trigger-pwm7-clk.dts   clk_m reparent overlay for exact trigger-PWM rates
+    Makefile                 Adds the .dtbo targets
 
-scripts/                     Build/deploy helpers (upstream's) + the ISP pipeline
-doc/                         Register reference (typ/pdf) + mirrored sources
+scripts/
+  install.sh                 Target-side installer (module + dtbo + boot entry)
+  configure_camera_dt.py     Configures camera-layout / external-trigger DT + PWM wiring
+  trigger_pwm.sh              Drives the external-trigger PWM pulse train
+  imx296_isp_pipeline.py      Offline/live raw -> color ISP pipeline (see Capturing below)
+
+doc/
+  imx296_registers.typ        Register reference (typ/pdf)
+  external-trigger-howto.md   External trigger wiring, arming, and verification cautions
+  external_sources/           Mirrored reference material (mainline driver, tuning data, etc.)
 ```
 
 The files under `source/` mirror the L4T `Linux_for_Tegra/source` layout and
@@ -121,6 +131,9 @@ imx296 9-001a: IMX296LQ sensor detected and registered
 
 ## Capturing
 
+`scripts/imx296_isp_pipeline.py` needs `python3-opencv` (OpenCV for Python)
+and `numpy` installed.
+
 **Raw V4L2** (both modes; Orin's VI needs a 64-byte-aligned stride —
 `preferred_stride` below):
 
@@ -171,11 +184,36 @@ is dB×10, 0–480, halve exposure ⇒ +60 gain.)
 - With `BLKLEVELAUTO` disabled (flicker fix), slow thermal black-level drift
   is uncompensated — if you see shadow lift in long sessions, use the ISP
   element's `black-offset` property.
+- **External trigger mode is new and lightly tested** — read
+  `doc/external-trigger-howto.md`'s wiring and arming cautions before relying
+  on it.
+
+## Changelog
+
+Notable fixes and additions since the initial bring-up. Each landed as its
+own `--no-ff` merge, one branch per fix — `git log` has the full history and
+rationale, and any of them can be reverted as a single merge commit.
+
+| Change | Details |
+|---|---|
+| Fixed exposure control | The sensor's 14 µs readout offset was being scaled by `exposure_factor` *before* subtraction instead of after — the math wrapped and pinned SHS1 at max, so the V4L2/Argus exposure control silently did nothing. Now correct and verified monotonic on hardware. |
+| Fixed black horizontal line | Two register deltas vs the RPi *production* driver: init byte `0x30af = 0x0b` (RPi's Fast-Trigger/MIPI-FE fix, on Sony's advice) and the missing `MIPIC_AREA3W (0x4182) = height` write. Verified gone on real captures. |
+| Fixed shadow/line flicker | The sensor's automatic black-level servo (`BLKLEVELAUTO`) oscillates ±1.5 counts @ 7–9 Hz (±35 @ 30 dB gain) — proven with capped-lens dark frames and a mid-stream register A/B. Disabled in favor of the fixed level the tuning data assumes (trade-off: no thermal-drift compensation; a manual trim exists in the companion ISP element). |
+| Gain now latches at frame boundary | `GAINDLY` set to 1-frame mode (the RPi production value) so gain+exposure steps land atomically on one frame. |
+| Added 1280×720 @ 90 fps mode (mode1) | Centered ROI crop, VMAX 750 → exactly 90.0 fps. Required making the driver's VMAX floor mode-relative — without that, the frame-rate control silently clamped the new mode back to ~60 fps. |
+| Added dual-camera overlay | `tegra234-p3767-camera-p3768-imx296-dual.dtbo` (both CSI connectors at once, `video0` + `video1`), modeled on NVIDIA's imx477-dual overlay. |
+| Removed overlay defects | PWDN gpio-hogs had targeted a Tegra210 address that doesn't exist on Orin (silently inert — and dangerous to "fix" in place); also removed phantom disable nodes and a `channel@1`/`reg=<0>` contradiction in the -C overlay. |
+| `#define DEBUG` off by default | Previously shipped with full register dumps plus a 1 s sleep inside every stream start. |
+| Rewrote ISP script (`scripts/imx296_isp_pipeline.py`) | Previous version didn't run (wrong tuning path). Now: offline/live raw → color pipeline with curve-constrained auto-AWB, argparse CLI, both sensor modes. |
+| Added external trigger mode (experimental) | New `trigger_mode` V4L2 control, plus `scripts/configure_camera_dt.py` (DT/PWM wiring) and `scripts/trigger_pwm.sh` (drives the trigger pulse train). Preliminary work — wiring, arming, and verification are documented in `doc/external-trigger-howto.md`, but this path is less hardware-proven than the fixes above; read the cautions there before wiring anything up. |
+| Added register provenance comments | Every deviating byte cites its source (mainline vs RPi tree vs measured) directly in the code. |
 
 ## Credits
 
 - **Jonathan Péclat** — original bring-up, driver, overlays, and register
-  documentation this fork stands on.
+  documentation this driver stands on.
+- **William Reed Seal-Foss** — the fixes, dual-camera/90 fps support,
+  external-trigger mode, and ISP pipeline rewrite described above.
 - Mainline `drivers/media/i2c/imx296.c` (Laurent Pinchart) and the Raspberry
   Pi kernel/libcamera projects — register sequences, tuning data, and the
   production reference against which the fixes here were verified.
